@@ -90,29 +90,61 @@ def extract_text_from_image(image_file):
             image = image.convert('RGB')
         
         extracted_text = _extract_with_trocr(image)
-        
+
         from .image_captioning import generate_alt_text
         caption_result = generate_alt_text(temp_path)
-        
+
         if os.path.exists(temp_path) and hasattr(image_file, 'save'):
             os.remove(temp_path)
-        
-        if not extracted_text or len(extracted_text.strip()) < 5:
-            main_text = f"Image Description: {caption_result.get('alt_text', '')}"
-            method = "blip_image_captioning"
-            note = "No readable text found in image. Generated description instead."
-        else:
-            main_text = extracted_text.strip()
+
+        # Pick the most informative caption available for downstream steps.
+        # Priority: enhanced (Groq) → detailed (Florence) → short alt-text.
+        rich_description = (
+            caption_result.get("enhanced_description")
+            or caption_result.get("detailed_caption")
+            or caption_result.get("alt_text")
+            or ""
+        ).strip()
+
+        ocr_text = (extracted_text or "").strip()
+
+        # Decide what becomes the "primary text" for the document.
+        #
+        # Old logic used OCR whenever len > 5 chars — so a diagram producing
+        # a single fragment like "AMOUNT" became the entire document, and
+        # downstream simplification/translation/bias all ran on six garbage
+        # characters. The new heuristic only trusts OCR when it actually
+        # looks like prose: enough words, real sentence boundaries.
+        if _ocr_looks_like_prose(ocr_text):
+            # Textbook scan / screenshot of an article: keep TrOCR text.
+            main_text = ocr_text
             method = "trocr_transformers"
             note = None
-        
+        elif rich_description:
+            # Diagram / photo / chart: use the AI description as primary
+            # content so simplification etc. operate on meaningful text.
+            main_text = rich_description
+            method = "florence_caption"
+            if ocr_text:
+                note = (
+                    "Image OCR returned only short fragments — using the AI "
+                    f"description as primary content. OCR fragments: \"{ocr_text[:200]}\""
+                )
+            else:
+                note = "No readable text in image. Using AI description as primary content."
+        else:
+            # Both OCR and caption failed — give up gracefully.
+            main_text = ocr_text or "Image"
+            method = "fallback"
+            note = "Could not generate an image description."
+
         result = {
             "success": True,
             "text": main_text,
             "method": method,
-            "source": "image_ocr"
+            "source": "image_ocr",
         }
-        
+
         if note:
             result["note"] = note
         
@@ -146,6 +178,36 @@ def extract_text_from_image(image_file):
             "error": str(e),
             "method": "trocr_transformers"
         }
+
+
+def _ocr_looks_like_prose(text: str) -> bool:
+    """Heuristic: does this OCR output look like real readable prose, or
+    just scattered label fragments from a diagram?
+
+    We accept it as prose when:
+      - At least 80 characters
+      - At least 15 words
+      - At least 1 sentence boundary (. / ! / ?)
+      - Average word length looks human (2.5 - 12 chars)
+
+    Tuned to reject typical diagram label fragments like "AMOUNT", "Input",
+    "Data Source Layer" while keeping textbook / article scans.
+    """
+    if not text:
+        return False
+    cleaned = text.strip()
+    if len(cleaned) < 80:
+        return False
+    words = cleaned.split()
+    if len(words) < 15:
+        return False
+    sentence_markers = sum(cleaned.count(p) for p in (". ", "! ", "? "))
+    if sentence_markers < 1:
+        return False
+    avg_len = sum(len(w) for w in words) / len(words)
+    if avg_len < 2.5 or avg_len > 12:
+        return False
+    return True
 
 
 def _extract_with_trocr(image):

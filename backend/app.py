@@ -35,7 +35,6 @@ CORS(
     allow_headers=["Content-Type", "X-User-Id", "Accept"],
 )
 
-
 def _current_user_id() -> str:
     return request.headers.get("X-User-Id") or "anonymous"
 
@@ -598,7 +597,8 @@ def generate_quiz_route():
         data = request.get_json() or {}
         doc_id = data.get("doc_id") or ""
         n = int(data.get("n_questions") or 5)
-        result = generator.generate_quiz(doc_id, user_id, n_questions=n)
+        difficulty = (data.get("difficulty") or "medium")
+        result = generator.generate_quiz(doc_id, user_id, n_questions=n, difficulty=difficulty)
         return jsonify(result)
     except Exception as exc:  # noqa: BLE001
         return jsonify({"success": False, "error": str(exc)}), 500
@@ -656,6 +656,54 @@ def generate_udl_check():
     except Exception as exc:  # noqa: BLE001
         return jsonify({"success": False, "error": str(exc)}), 500
 
+@app.route("/voice/models", methods=["GET"])
+def get_voice_models_route():
+    try:
+        from models.voice_separation import get_voice_models
+        models = get_voice_models()
+        return jsonify(models)
+    except Exception as exc:
+        return jsonify({"success": False, "error": str(exc)}), 500
+
+
+@app.route("/voice/extract_voice", methods=["POST"])
+def extract_voice_route():
+    temp_path = None
+    try:
+        if "mixture_file" not in request.files:
+            return jsonify({"success": False, "error": "No mixture_file provided"}), 400
+
+        mixture_file = request.files["mixture_file"]
+        if not mixture_file.filename:
+            return jsonify({"success": False, "error": "Empty audio file"}), 400
+
+        model_name = request.form.get("model_name", "speechbrain/sepformer-wsj02mix")
+        try:
+            source_index = int(request.form.get("source_index", "0"))
+        except ValueError:
+            source_index = 0
+
+        import tempfile
+        suffix = os.path.splitext(mixture_file.filename)[1] or ".wav"
+        temp_path = tempfile.mktemp(suffix=suffix)
+        mixture_file.save(temp_path)
+
+        print(f"🎙️  Voice separation: {mixture_file.filename} ({model_name}, idx={source_index})")
+
+        from models.voice_separation import separate_voice
+        result = separate_voice(temp_path, model_name, source_index)
+
+        return jsonify(result)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"success": False, "error": str(exc)}), 500
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -665,6 +713,15 @@ if __name__ == "__main__":
     print("Health check: http://localhost:8000/health")
     print(f"Vector store: {'Pinecone (configured)' if vector_store.is_available() else 'DISABLED — PINECONE_API_KEY missing'}")
     print("=" * 60)
+    # Pre-install the speechbrain LazyModule patch BEFORE app.run() starts the
+    # werkzeug reloader poll thread. Otherwise the reloader walks sys.modules,
+    # touches speechbrain.k2_integration's __file__, triggers a real `import k2`
+    # (not installed on Windows), and the reloader thread dies.
+    try:
+        from models.voice_separation import _patch_speechbrain_lazy_module
+        _patch_speechbrain_lazy_module()
+    except Exception as _patch_exc:
+        print(f"[startup] speechbrain LazyModule patch skipped: {_patch_exc}")
     # Make the debug reloader watch nested module files too — otherwise edits
     # to backend/models/*.py don't trigger a reload and the live server keeps
     # serving stale code (this caused the "bias still shows 100%" bug).

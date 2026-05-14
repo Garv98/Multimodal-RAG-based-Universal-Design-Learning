@@ -25,20 +25,18 @@ export function Footer() {
             <Link href="/video" className="text-muted-foreground hover:text-foreground transition-colors">Video</Link>
             <Link href="/results" className="text-muted-foreground hover:text-foreground transition-colors">Results</Link>
             <a
-              href="https://github.com/Garv98/Universal-Content-Converter"
+              href="https://github.com/Garv98/Multimodal-RAG-based-Universal-Design-Learning"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 text-muted-foreground hover:text-foreground transition-colors"
             >
-              <Github className="h-4 w-4" aria-hidden="true" />
+        
               GitHub
             </a>
           </nav>
 
           <p className="text-xs text-muted-foreground flex items-center gap-1.5">
-            © {new Date().getFullYear()} Team NovaPulse · RVCE · Built with
-            <Heart className="h-3 w-3 text-rose-500 fill-rose-500" aria-hidden="true" />
-            for SDG 4
+            © {new Date().getFullYear()} Team NovaPulse
           </p>
         </div>
       </div>

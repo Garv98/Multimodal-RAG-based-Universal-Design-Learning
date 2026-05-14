@@ -22,3 +22,5 @@ einops
 spacy
 pinecone>=5.0.0
 tiktoken
+speechbrain
+torchaudio

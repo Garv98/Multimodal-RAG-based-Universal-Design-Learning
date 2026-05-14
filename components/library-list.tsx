@@ -58,7 +58,7 @@ export function LibraryList({ selectedDocId, onSelect, refreshKey }: Props) {
   }, [refreshKey])
 
   async function handleDelete(doc: LibraryDocument) {
-    if (!confirm(`Delete "${doc.name}" from your library?`)) return
+    if (!confirm(`Delete "${doc.name}" from your library? This also removes it from vector search.`)) return
     setDeletingId(doc.id)
     try {
       const res = await deleteDocument(doc.id)
@@ -139,16 +139,20 @@ export function LibraryList({ selectedDocId, onSelect, refreshKey }: Props) {
                   </Button>
                   <Button
                     size="sm"
-                    variant="ghost"
+                    variant="outline"
                     onClick={() => handleDelete(doc)}
                     disabled={deletingId === doc.id}
                     aria-label={`Delete ${doc.name}`}
+                    className="gap-2 text-destructive border-destructive/40 hover:bg-destructive/10"
                   >
                     {deletingId === doc.id ? (
                       <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
                     ) : (
                       <Trash2 className="h-4 w-4" aria-hidden="true" />
                     )}
+                    <span className="hidden sm:inline">
+                      {deletingId === doc.id ? "Deleting" : "Delete"}
+                    </span>
                   </Button>
                 </li>
               )

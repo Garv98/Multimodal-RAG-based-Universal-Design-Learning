@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from transformers import pipeline
@@ -410,9 +411,17 @@ def detect_bias(text):
     rb = _rule_based_bias_detection(text)
     ml = _ml_bias_detection(text)
     ctx = _contextual_bias_detection(text)
+    # LLM is the primary detector for subtle / paraphrased bias. The other
+    # three layers stay as a deterministic safety net (free, offline) and
+    # for cases where Groq is unreachable.
+    llm = _llm_bias_detection(text)
 
-    merged_flags = _merge_and_dedupe_flags(rb["flags"] + ml["flags"] + ctx["flags"])
-    suggestions = _dedupe_suggestions(rb["suggestions"] + ctx["suggestions"])
+    merged_flags = _merge_and_dedupe_flags(
+        rb["flags"] + ml["flags"] + ctx["flags"] + llm["flags"]
+    )
+    suggestions = _dedupe_suggestions(
+        rb["suggestions"] + ctx["suggestions"] + llm.get("suggestions", [])
+    )
 
     # Categories: keep the most informative type per category bucket, then
     # sort by descending count for the report.
@@ -425,7 +434,13 @@ def detect_bias(text):
     sentence_count = max(1, len(_split_sentences(text)))
     bias_score = _calculate_bias_score(merged_flags, sentence_count)
 
-    if os.getenv("GROQ_BIAS_EXPLAIN", "").lower() in ("1", "true", "yes"):
+    # LLM detector already attaches explanations + rewrites. Only run the
+    # legacy per-flag enrichment when the user explicitly opted in AND the
+    # primary LLM detection didn't run (no GROQ_API_KEY, request failed, etc).
+    if (
+        os.getenv("GROQ_BIAS_EXPLAIN", "").lower() in ("1", "true", "yes")
+        and not llm["flags"]
+    ):
         _augment_flags_with_groq(merged_flags, text)
 
     results = {
@@ -493,6 +508,144 @@ def _ml_bias_detection(text: str) -> dict:
                 })
 
     return {"flags": flags}
+
+
+# ---------------------------------------------------------------------------
+# LLM detection (Groq) — the primary detector for subtle, paraphrased, or
+# reported-speech bias the regex + hate/toxicity ML pipelines miss.
+# ---------------------------------------------------------------------------
+
+
+_LLM_SYSTEM_PROMPT = """You are a strict, fair bias auditor. Read the user's text and surface every clause that expresses or describes a stereotype, prejudice, or unfair generalisation — INCLUDING bias that is reported in the third person ("many believe X"), implied, or framed neutrally. Treat phrases like "are inherently more intelligent than" or "viewed as smarter than" as bias even when the surrounding paragraph is critical of that bias.
+
+Categories (use these exact slugs):
+- academic_bias  -> comparing students/people on intelligence by subject (STEM vs arts), test scores, language fluency, school prestige
+- gender         -> stereotyping based on gender or sex
+- racial         -> stereotyping based on race or ethnicity
+- religion       -> stereotyping based on faith
+- age            -> stereotyping by age, generation
+- disability     -> prejudice or limiting framing of disability
+- sexual_orientation -> bias by orientation
+- socioeconomic  -> bias by wealth or class
+- cultural       -> cultural superiority, "us vs them" framing
+- political      -> partisan generalisations
+- body_image     -> bias by body shape or size
+- stereotype_general -> any sweeping generalisation not covered above
+
+Severity scale:
+- high   : explicit stereotype or strong unfair claim ("X are inherently smarter than Y")
+- medium : implied comparison, devaluation, or generalisation ("X is just a hobby", "real Xs do not...")
+- low    : marginal / edge case (mild loaded framing)
+
+Output ONLY valid minified JSON with this shape:
+{"flags":[{"matched_text":"...exact substring from input...","type":"academic_bias","severity":"high","confidence":0.0-1.0,"explanation":"one short sentence","suggested_rewrite":"a more inclusive rewrite preserving meaning"}]}
+
+Rules:
+- "matched_text" MUST be an exact substring copied verbatim from the user's text (max ~220 chars). Do NOT paraphrase or invent text.
+- If the entire text is genuinely inclusive and contains NO stereotype claim (even quoted/reported), return {"flags":[]}.
+- If reported speech contains a stereotype ("schools promote the belief that X are smarter"), flag X — the bias is in the embedded claim, not in the reporter.
+- Up to 12 flags max. Prioritise the strongest signals.
+- No prose, no markdown fences, no commentary outside the JSON object."""
+
+
+def _llm_bias_detection(text: str) -> dict:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or not text.strip():
+        return {"flags": [], "suggestions": []}
+    try:
+        from groq import Groq
+    except ImportError:
+        return {"flags": [], "suggestions": []}
+
+    # Cap input to ~18k chars (~4k tokens) so a giant document doesn't blow
+    # the context window or cost. Bias signal in the first ~3k words is
+    # plenty for a content-extraction tool.
+    capped = text[:18000]
+
+    client = Groq(api_key=api_key)
+    model = os.getenv(
+        "GROQ_BIAS_MODEL",
+        os.getenv("GROQ_GENERATION_MODEL", "llama-3.3-70b-versatile"),
+    )
+
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            temperature=0.0,
+            max_tokens=2000,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": _LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": capped},
+            ],
+        )
+        content = (completion.choices[0].message.content or "").strip()
+        data = json.loads(content)
+    except Exception as exc:  # noqa: BLE001 — graceful degrade
+        print(f"⚠️ Groq bias detection failed: {exc}")
+        return {"flags": [], "suggestions": []}
+
+    raw_flags = data.get("flags") if isinstance(data, dict) else None
+    if not isinstance(raw_flags, list):
+        return {"flags": [], "suggestions": []}
+
+    # Collapse whitespace so the substring check tolerates the model emitting
+    # a span with slightly different spacing than the original text.
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", s).strip().lower()
+
+    text_norm = _norm(text)
+    valid_types = {
+        "academic_bias", "gender", "racial", "religion", "age", "disability",
+        "sexual_orientation", "socioeconomic", "cultural", "political",
+        "body_image", "stereotype_general",
+    }
+    valid_severity = {"high", "medium", "low"}
+
+    flags: list[dict] = []
+    suggestions: list[dict] = []
+    for raw in raw_flags[:12]:
+        if not isinstance(raw, dict):
+            continue
+        matched = (raw.get("matched_text") or "").strip()
+        if not matched:
+            continue
+        # Reject hallucinated spans the model didn't actually copy.
+        if _norm(matched) not in text_norm:
+            continue
+        bias_type = raw.get("type") or "stereotype_general"
+        if bias_type not in valid_types:
+            bias_type = "stereotype_general"
+        severity = (raw.get("severity") or "medium").lower()
+        if severity not in valid_severity:
+            severity = "medium"
+        try:
+            confidence = float(raw.get("confidence") or 0.85)
+        except (TypeError, ValueError):
+            confidence = 0.85
+        confidence = max(0.0, min(1.0, confidence))
+
+        flag = {
+            "type": bias_type,
+            "matched_text": matched[:300],
+            "severity": severity,
+            "confidence": round(confidence, 3),
+            "source": "llm",
+        }
+        explanation = (raw.get("explanation") or "").strip()
+        if explanation:
+            flag["explanation"] = explanation[:300]
+        rewrite = (raw.get("suggested_rewrite") or "").strip()
+        if rewrite:
+            flag["suggested_rewrite"] = rewrite[:400]
+            suggestions.append({
+                "original": matched[:300],
+                "suggested": rewrite[:400],
+                "type": bias_type,
+            })
+        flags.append(flag)
+
+    return {"flags": flags, "suggestions": suggestions}
 
 
 # ---------------------------------------------------------------------------

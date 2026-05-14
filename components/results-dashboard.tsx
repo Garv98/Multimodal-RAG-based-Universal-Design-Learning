@@ -30,6 +30,8 @@ import {
   Eye,
   CheckCircle2,
   Sparkles,
+  Headphones,
+  Loader2,
   AlertCircle,
   Pause,
   Square,
@@ -45,6 +47,7 @@ import {
 import { Button } from "@/components/ui/button"
 import { CognitiveLoadIndicator, ExportAccessibleFormats } from "@/components/accessibility-panel"
 import { StudyTools } from "@/components/study-tools"
+import { extractVoice, listVoiceModels, type VoiceModelInfo, type VoiceSeparationResult } from "@/lib/api"
 
 interface Results {
   extraction?: {
@@ -241,10 +244,19 @@ export function ResultsDashboard() {
   const [currentDocId, setCurrentDocId] = useState<string | null>(null)
   const [currentDocName, setCurrentDocName] = useState<string | null>(null)
 
+  // Pick the default tab based on the input modality, computed once at mount
+  // from what's already in sessionStorage. For image inputs the alttext tab
+  // is the most informative landing view (image preview + AI description),
+  // so we surface that by default. Falls back to simplified for text/PDF/audio.
+  const [activeTab, setActiveTab] = useState<string>("simplified")
+  const [altTextImage, setAltTextImage] = useState<string | null>(null)
+
   useEffect(() => {
     setCurrentDocId(sessionStorage.getItem("udl-current-doc-id"))
     setCurrentDocName(sessionStorage.getItem("udl-current-doc-name"))
     const storedResults = sessionStorage.getItem("udl-results")
+    const storedAltImage = sessionStorage.getItem("udl-alttext-image")
+    setAltTextImage(storedAltImage)
     if (storedResults) {
       try {
         const parsed = JSON.parse(storedResults)
@@ -324,6 +336,11 @@ export function ResultsDashboard() {
         console.log("🚨 BIAS flags count:", parsed.bias?.flags?.length)
         
         setResults(mergedResults)
+
+        let nextTab = "simplified"
+        if (parsed.alttext) nextTab = "alttext"
+        else if (parsed.transcript || parsed.video) nextTab = "transcript"
+        setActiveTab(nextTab)
       } catch (error) {
         console.error("❌ Error loading results:", error)
         setResults(mockResults)
@@ -405,7 +422,7 @@ export function ResultsDashboard() {
         </div>
       )}
 
-      <Tabs defaultValue="simplified" className="w-full">
+      <Tabs value={activeTab} onValueChange={setActiveTab} className="w-full">
         <TabsList className="flex flex-wrap h-auto gap-1 mb-6 bg-card p-1">
         <TabsTrigger value="simplified" className="gap-2">
           <FileText className="h-4 w-4" aria-hidden="true" />
@@ -426,6 +443,10 @@ export function ResultsDashboard() {
         <TabsTrigger value="transcript" className="gap-2">
           <Mic className="h-4 w-4" aria-hidden="true" />
           <span className="hidden sm:inline">Transcript</span>
+        </TabsTrigger>
+        <TabsTrigger value="voice" className="gap-2">
+          <Headphones className="h-4 w-4" aria-hidden="true" />
+          <span className="hidden sm:inline">Voice</span>
         </TabsTrigger>
         <TabsTrigger value="bias" className="gap-2">
           <Shield className="h-4 w-4" aria-hidden="true" />
@@ -568,11 +589,11 @@ export function ResultsDashboard() {
             {results.alttext?.alt_text ? (
               <div className="space-y-6">
                 {/* Image Preview */}
-                {typeof window !== 'undefined' && sessionStorage.getItem("udl-alttext-image") && (
+                {altTextImage && (
                   <Card className="bg-secondary border-border">
                     <CardContent className="pt-6">
                       <img 
-                        src={sessionStorage.getItem("udl-alttext-image") || ""} 
+                        src={altTextImage}
                         alt="Uploaded image for alt text generation"
                         className="w-full h-auto rounded-lg border border-border"
                       />
@@ -991,6 +1012,10 @@ export function ResultsDashboard() {
             )}
           </CardContent>
         </Card>
+      </TabsContent>
+
+      <TabsContent value="voice">
+        <VoiceIsolationTab />
       </TabsContent>
 
       <TabsContent value="bias">
@@ -1798,6 +1823,353 @@ function TranslationTab({ originalText }: { originalText: string }) {
         </>
       )}
     </div>
+  )
+}
+
+
+function audioMime(format: string): string {
+  const normalized = (format || "wav").toLowerCase()
+  if (normalized === "flac") return "audio/flac"
+  if (normalized === "ogg") return "audio/ogg"
+  return "audio/wav"
+}
+
+function base64ToBlob(base64: string, mime: string): Blob {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i)
+  }
+  return new Blob([bytes], { type: mime })
+}
+
+function formatMetric(value: unknown, digits: number = 2): string {
+  if (typeof value !== "number" || Number.isNaN(value)) return "—"
+  return value.toFixed(digits)
+}
+
+function VoiceIsolationTab() {
+  const [models, setModels] = useState<VoiceModelInfo[]>([])
+  const [modelLoading, setModelLoading] = useState(false)
+  const [modelError, setModelError] = useState<string | null>(null)
+  const [selectedModel, setSelectedModel] = useState<string>("")
+  const [sourceIndex, setSourceIndex] = useState<string>("0")
+  const [mixtureFile, setMixtureFile] = useState<File | null>(null)
+  const [processing, setProcessing] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [result, setResult] = useState<VoiceSeparationResult | null>(null)
+  const [audioUrl, setAudioUrl] = useState<string | null>(null)
+
+  useEffect(() => {
+    let active = true
+    async function loadModels() {
+      setModelLoading(true)
+      setModelError(null)
+      const res = await listVoiceModels()
+      if (!active) return
+      if (res.success && res.data?.models) {
+        const available = res.data.models.filter((m) => m.available)
+        setModels(available)
+        const defaultId = res.data.default
+        const fallback = available[0]?.id || ""
+        setSelectedModel(defaultId && available.some((m) => m.id === defaultId) ? defaultId : fallback)
+      } else {
+        setModelError(res.error || "Voice service unavailable")
+      }
+      setModelLoading(false)
+    }
+    loadModels()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  useEffect(() => {
+    const audioData = sessionStorage.getItem("udl-audio-file")
+    const cachedFiles = typeof window !== 'undefined' ? (window as any).__udl_files : null
+    
+    if (audioData) {
+      try {
+        const audio = JSON.parse(audioData)
+        if (audio.isLarge && cachedFiles?.audio) {
+          setMixtureFile(cachedFiles.audio)
+        } else if (audio.data) {
+          const mime = audio.type || "audio/wav"
+          const blob = base64ToBlob(audio.data, mime)
+          const file = new File([blob], audio.name || "audio.wav", { type: mime })
+          setMixtureFile(file)
+        }
+      } catch (e) {
+        console.error("Error parsing audio data", e)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!result?.audio_b64) return
+    const mime = audioMime(result.audio_format)
+    const allSources = ((result as any).sources_b64 as string[] | undefined) ?? [result.audio_b64]
+    const idx = Math.min(Math.max(0, Number(sourceIndex) || 0), allSources.length - 1)
+    const blob = base64ToBlob(allSources[idx], mime)
+    const url = URL.createObjectURL(blob)
+    setAudioUrl(url)
+    return () => {
+      URL.revokeObjectURL(url)
+    }
+  }, [result, sourceIndex])
+
+  async function handleSeparate() {
+    if (!mixtureFile) {
+      setError("No upfront audio file found. Please upload an audio file first on the main page.")
+      return
+    }
+    if (!selectedModel) {
+      setError("Select a separation model.")
+      return
+    }
+
+    const indexValue = Number(sourceIndex)
+    if (Number.isNaN(indexValue) || indexValue < 0) {
+      setError("Speaker index must be 0 or 1.")
+      return
+    }
+
+    setProcessing(true)
+    setError(null)
+    setResult(null)
+
+    const res = await extractVoice({
+      mixtureFile,
+      modelName: selectedModel,
+      sourceIndex: indexValue,
+    })
+
+    if (res.success && res.result) {
+      setResult(res.result)
+    } else {
+      setError(res.error || "Voice separation failed.")
+    }
+    setProcessing(false)
+  }
+
+  const metrics = (result?.metrics || {}) as Record<string, unknown>
+  const viz = (result?.viz || {}) as Record<string, string>
+
+  return (
+    <Card className="bg-card border-border">
+      <CardHeader>
+        <CardTitle className="text-foreground flex items-center gap-2">
+          <Headphones className="h-5 w-5 text-primary" aria-hidden="true" />
+          Voice isolation
+        </CardTitle>
+        <CardDescription>
+          Extract the lecturer&apos;s voice from the upfront uploaded audio.
+          SepFormer runs on CPU, so the first 30 seconds are processed by default — trim long
+          uploads for full coverage.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-5">
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-3">
+            <label className="text-sm font-medium text-foreground">Audio file</label>
+            {mixtureFile ? (
+              <div className="rounded-md border border-border bg-muted/30 p-3 text-sm text-foreground">
+                <span className="font-semibold text-primary">Loaded: </span>
+                {mixtureFile.name}
+              </div>
+            ) : (
+              <p className="text-sm text-muted-foreground italic">No audio file was uploaded upfront.</p>
+            )}
+            <p className="text-xs text-muted-foreground">
+              Supported formats: WAV, FLAC, OGG. Try the lecturer as speaker 0 or 1.
+            </p>
+          </div>
+
+          <div className="space-y-3">
+            <label className="text-sm font-medium text-foreground">Model</label>
+            {modelLoading ? (
+              <p className="text-sm text-muted-foreground">Loading models…</p>
+            ) : modelError ? (
+              <p className="text-sm text-destructive">{modelError}</p>
+            ) : (
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground"
+              >
+                {models.map((model) => (
+                  <option key={model.id} value={model.id}>
+                    {model.label ? `${model.label} (${model.id})` : model.id}
+                  </option>
+                ))}
+              </select>
+            )}
+
+            {((models.find((m) => m.id === selectedModel) as any)?.num_outputs ?? 2) > 1 && (
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-foreground">Speaker index</label>
+                <select
+                  value={sourceIndex}
+                  onChange={(e) => setSourceIndex(e.target.value)}
+                  className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground"
+                >
+                  <option value="0">0 (Speaker A)</option>
+                  <option value="1">1 (Speaker B)</option>
+                </select>
+                <p className="text-xs text-muted-foreground">
+                  You can also switch speakers after separation without re-running.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <Button onClick={handleSeparate} disabled={!mixtureFile || !selectedModel || processing} className="gap-2">
+          {processing ? (
+            <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+          ) : (
+            <Headphones className="h-4 w-4" aria-hidden="true" />
+          )}
+          {processing
+            ? "Processing…"
+            : ((models.find((m) => m.id === selectedModel) as any)?.num_outputs ?? 2) === 1
+            ? "Enhance voice (denoise)"
+            : "Extract lecturer audio"}
+        </Button>
+
+        {error && (
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+            {error}
+          </div>
+        )}
+
+        {result && (
+          <div className="space-y-4">
+            {(result as any).truncated && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-700 dark:text-amber-300">
+                Input was {(result as any).input_duration_seconds?.toFixed?.(1)}s — SepFormer is too
+                heavy for long audio on CPU, so only the first
+                {" "}{(result as any).processed_seconds?.toFixed?.(0)}s were separated.
+                Trim the upload (or set <code>VOICE_MAX_INPUT_SECONDS</code> in the backend env) for full coverage.
+              </div>
+            )}
+            {Array.isArray((result as any).sources_b64) && (result as any).sources_b64.length > 1 && (
+              <div className="rounded-md border border-border bg-muted/30 p-3">
+                <p className="text-xs font-medium text-foreground mb-2">
+                  SepFormer split the mix into {(result as any).sources_b64.length} speakers.
+                  Switch between them below — no need to re-run separation.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  {((result as any).sources_b64 as string[]).map((_, i) => {
+                    const stats = ((result as any).source_stats as Array<{ peak: number; rms: number }> | undefined)?.[i]
+                    const active = String(i) === sourceIndex
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        onClick={() => setSourceIndex(String(i))}
+                        className={`rounded-md px-3 py-1.5 text-xs font-medium border transition ${
+                          active
+                            ? "bg-primary text-primary-foreground border-primary"
+                            : "bg-background text-foreground border-border hover:bg-muted"
+                        }`}
+                      >
+                        Speaker {i}
+                        {stats && (
+                          <span className={`ml-2 ${active ? "opacity-90" : "opacity-60"}`}>
+                            rms {stats.rms.toFixed(3)}
+                          </span>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+            <div className="rounded-lg border border-border bg-muted/30 p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-semibold text-foreground">
+                    {((result as any).sources_b64?.length ?? 1) > 1 ? "Separated audio" : "Enhanced voice"}
+                  </p>
+                  <p className="text-xs text-muted-foreground">
+                    Model: {result.model_used}
+                    {((result as any).sources_b64?.length ?? 1) > 1 && ` · Now playing: Speaker ${sourceIndex}`}
+                  </p>
+                </div>
+                {audioUrl && (
+                  <Button asChild variant="outline" size="sm" className="gap-2">
+                    <a href={audioUrl} download={`speaker-${sourceIndex}.${result.audio_format || "wav"}`}>
+                      <Download className="h-4 w-4" aria-hidden="true" />
+                      Download
+                    </a>
+                  </Button>
+                )}
+              </div>
+              {audioUrl && (
+                <audio controls src={audioUrl} className="mt-3 w-full" />
+              )}
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-3">
+              <div className="rounded-md border border-border bg-background p-3">
+                <p className="text-xs text-muted-foreground">Elapsed</p>
+                <p className="text-lg font-semibold text-foreground">
+                  {result.elapsed_seconds.toFixed(2)}s
+                </p>
+              </div>
+              <div className="rounded-md border border-border bg-background p-3">
+                <p className="text-xs text-muted-foreground">Target similarity</p>
+                <p className="text-lg font-semibold text-foreground">
+                  {formatMetric(metrics.target_similarity, 3)}
+                </p>
+              </div>
+              <div className="rounded-md border border-border bg-background p-3">
+                <p className="text-xs text-muted-foreground">Confidence margin</p>
+                <p className="text-lg font-semibold text-foreground">
+                  {formatMetric(metrics.confidence_margin, 3)}
+                </p>
+              </div>
+            </div>
+
+            {(viz.mixture_spectrogram_png || viz.target_spectrogram_png || viz.mask_png) && (
+              <div className="grid gap-3 md:grid-cols-2">
+                {viz.mixture_spectrogram_png && (
+                  <div className="rounded-lg border border-border bg-background p-3">
+                    <p className="text-xs text-muted-foreground mb-2">Mixture spectrogram</p>
+                    <img
+                      src={`data:image/png;base64,${viz.mixture_spectrogram_png}`}
+                      alt="Mixture spectrogram"
+                      className="w-full rounded-md"
+                    />
+                  </div>
+                )}
+                {viz.target_spectrogram_png && (
+                  <div className="rounded-lg border border-border bg-background p-3">
+                    <p className="text-xs text-muted-foreground mb-2">Extracted target</p>
+                    <img
+                      src={`data:image/png;base64,${viz.target_spectrogram_png}`}
+                      alt="Target spectrogram"
+                      className="w-full rounded-md"
+                    />
+                  </div>
+                )}
+                {viz.mask_png && (
+                  <div className="rounded-lg border border-border bg-background p-3 md:col-span-2">
+                    <p className="text-xs text-muted-foreground mb-2">Mask visualization</p>
+                    <img
+                      src={`data:image/png;base64,${viz.mask_png}`}
+                      alt="Mask visualization"
+                      className="w-full rounded-md"
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 

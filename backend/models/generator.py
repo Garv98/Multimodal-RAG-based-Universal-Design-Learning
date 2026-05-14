@@ -252,19 +252,40 @@ def generate_summary(
     yield from _stream_chat(system_prompt=system_prompt, user_query="Produce the summary now.")
 
 
-def generate_quiz(doc_id: str, user_id: str, n_questions: int = 5) -> dict:
+def generate_quiz(
+    doc_id: str,
+    user_id: str,
+    n_questions: int = 5,
+    difficulty: str = "medium",
+) -> dict:
     """Return parsed quiz JSON. Non-streaming (clients render after parse)."""
     loaded = _load_doc_text(doc_id, user_id)
     if loaded is None:
         return {"success": False, "error": f"Document {doc_id} not found."}
     doc_name, body = loaded
     n = max(3, min(10, int(n_questions)))
+    diff = (difficulty or "medium").strip().lower()
+    if diff not in {"easy", "medium", "hard"}:
+        diff = "medium"
+
+    difficulty_directive = {
+        "easy": (
+            "Use direct recall questions that match key sentences. Keep wording simple."
+        ),
+        "medium": (
+            "Mix direct recall and basic reasoning across sections. Keep distractors plausible."
+        ),
+        "hard": (
+            "Favor multi-step reasoning, comparisons, or cause-effect. Distractors should be subtle."
+        ),
+    }[diff]
 
     system_prompt = (
         "You are an educational quiz generator. Read the document and produce "
         f"exactly {n} multiple-choice questions that test understanding of the "
         "most important concepts. Avoid trivia. Cover different sections of the "
         "document. Make distractors plausible but clearly wrong.\n\n"
+        f"Difficulty: {difficulty_directive}\n\n"
         "Reply with a JSON object of this exact shape:\n"
         "{\n"
         '  "questions": [\n'
